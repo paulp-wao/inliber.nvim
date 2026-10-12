@@ -18,7 +18,7 @@ The Inline Interaction - This is where code is applied directly to a Neovim buff
 ---@field lines table Lines in the buffer before the inline changes
 ---@field messages table Non-system messages sent across the conversation
 ---@field opts table
----@field original_content? string[] The original buffer content before LLM changes
+---@field original_region? string[] The lines the diff replaced, restored on reject
 ---@field pos? { line: number, col: number, bufnr: number } Where to place the generated code
 ---@field prompts table The prompts to send to the LLM
 ---@field spinner? Inliber.Spinner Progress feedback while the tool loop runs
@@ -50,6 +50,8 @@ local utils = require("inliber.utils")
 
 local api = vim.api
 local fmt = string.format
+
+local marks_ns = api.nvim_create_namespace("inliber.inline.marks")
 
 local user_role = config.constants.USER_ROLE
 
@@ -142,6 +144,21 @@ local function code_block(message, filetype, code)
   )
 end
 
+---Get the rows that differ between two versions of a buffer
+---@param opts { from: string[], to: string[] }
+---@return { first: number, from_end: number, to_end: number } 0-based first row and exclusive end rows
+local function get_changed_rows(opts)
+  local first = 0
+  while first < #opts.from and first < #opts.to and opts.from[first + 1] == opts.to[first + 1] do
+    first = first + 1
+  end
+  local from_end, to_end = #opts.from, #opts.to
+  while from_end > first and to_end > first and opts.from[from_end] == opts.to[to_end] do
+    from_end, to_end = from_end - 1, to_end - 1
+  end
+  return { first = first, from_end = from_end, to_end = to_end }
+end
+
 ---Overwrite the given selection in the buffer with an empty string
 ---@param context table The buffer context in the inline class
 local function overwrite_selection(context)
@@ -173,6 +190,9 @@ local Inline = {}
 
 ---@type Inliber.Inline|nil The last ask conversation retained for resume
 local last_ask = nil
+
+---@type table<number, Inliber.Inline[]> The requests waiting on the LLM in each buffer
+local running_requests = {}
 
 ---Store an ask conversation for later resume
 ---@param inline Inliber.Inline
@@ -451,9 +471,54 @@ function Inline:make_ext_prompts()
   return prompts
 end
 
+---Get the running request in a buffer whose selection is closest to the cursor
+---@param bufnr number
+---@return Inliber.Inline|nil
+function Inline.get_request_at_cursor(bufnr)
+  local requests = running_requests[bufnr] or {}
+  if #requests < 2 or api.nvim_get_current_buf() ~= bufnr then
+    return requests[#requests]
+  end
+
+  local cursor_line = api.nvim_win_get_cursor(0)[1]
+  local closest, closest_distance
+  for _, request in ipairs(requests) do
+    local start_line, end_line = request:_get_selection_lines()
+    local distance = math.max(start_line - cursor_line, cursor_line - end_line, 0)
+    if not closest_distance or distance < closest_distance then
+      closest, closest_distance = request, distance
+    end
+  end
+  return closest
+end
+
+---Register the request as running and map the stop key in its buffer
+---@return nil
+function Inline:_start_request()
+  local requests = running_requests[self.bufnr] or {}
+  running_requests[self.bufnr] = requests
+  if not vim.tbl_contains(requests, self) then
+    table.insert(requests, self)
+  end
+  self:set_keymaps(self.buffer_context.bufnr, { keymaps = { "stop" } })
+end
+
+---Unregister the request, removing the stop key once no other request runs in the buffer
+---@return nil
+function Inline:_finish_request()
+  local requests = vim.tbl_filter(function(request)
+    return request ~= self
+  end, running_requests[self.bufnr] or {})
+  running_requests[self.bufnr] = requests
+  if #requests == 0 then
+    require("inliber.interactions.inline.keymaps").clear_map(config.interactions.inline.keymaps, self.bufnr)
+  end
+end
+
 ---Stop the current request
 ---@return nil
 function Inline:stop()
+  self:_finish_request()
   local tool_loop = self.tool_loop
   self.tool_loop = nil
   if tool_loop then
@@ -474,11 +539,54 @@ local _streaming = true
 ---@param prompts table The prompts to send to the LLM
 ---@return nil
 function Inline:_submit(prompts)
+  if self.intent == "edit" then
+    self:_track_selection()
+  end
   local tools = config.interactions.inline.tools
   if tools and tools.enabled then
     return self:submit_with_tools(prompts)
   end
   return self:submit(prompts)
+end
+
+---Mark the selected lines so the edit still lands on them if other edits move them
+---@return nil
+function Inline:_track_selection()
+  local context = self.buffer_context
+  self.selection_mark = api.nvim_buf_set_extmark(context.bufnr, marks_ns, context.start_line - 1, 0, {
+    end_row = context.end_line - 1,
+    end_col = 0,
+    end_right_gravity = true,
+  })
+end
+
+---Get the lines the selection covers now, following any edits made since it was marked
+---@return number, number
+function Inline:_get_selection_lines()
+  local context = self.buffer_context
+  if self.selection_mark then
+    local mark = api.nvim_buf_get_extmark_by_id(context.bufnr, marks_ns, self.selection_mark, { details = true })
+    if mark[1] then
+      return mark[1] + 1, mark[3].end_row + 1
+    end
+  end
+  return context.start_line, context.end_line
+end
+
+---Move the selection to wherever its lines are now
+---@return nil
+function Inline:_update_selection()
+  self.buffer_context.start_line, self.buffer_context.end_line = self:_get_selection_lines()
+end
+
+---Delete the extmarks this edit placed in the buffer
+---@return nil
+function Inline:_clear_marks()
+  for _, mark in ipairs({ self.selection_mark, self.region_mark }) do
+    pcall(api.nvim_buf_del_extmark, self.buffer_context.bufnr, marks_ns, mark)
+  end
+  self.selection_mark = nil
+  self.region_mark = nil
 end
 
 ---Run the prompt through the headless tool loop
@@ -490,7 +598,7 @@ function Inline:submit_with_tools(prompts)
   -- Remember the adapter's streaming setting so reset() restores it unchanged
   _streaming = self.adapter.opts and self.adapter.opts.stream
 
-  self:set_keymaps(self.buffer_context.bufnr, { keymaps = { "stop" } })
+  self:_start_request()
   self:_start_spinner("Inliber")
 
   local messages = self:_prepare_tool_messages(prompts)
@@ -639,7 +747,7 @@ function Inline:submit(prompt)
   _streaming = self.adapter.opts.stream
   self.adapter.opts.stream = false
 
-  self:set_keymaps(self.buffer_context.bufnr, { keymaps = { "stop" } })
+  self:_start_request()
 
   self.current_request = client
     .new({ adapter = self.adapter:map_schema_to_params(), user_args = { event = "InlineStarted" } })
@@ -648,7 +756,7 @@ function Inline:submit(prompt)
       ---@param data table
       ---@param adapter Inliber.HTTPAdapter The modified adapter from the http client
       callback = function(err, data, adapter)
-        require("inliber.interactions.inline.keymaps").clear_map(config.interactions.inline.keymaps, self.bufnr)
+        self:_finish_request()
 
         local function error(msg)
           log:error("[Inline] Request failed with error %s", msg)
@@ -717,6 +825,7 @@ function Inline:done(output)
   end
 
   vim.schedule(function()
+    self:_update_selection()
     if not config.display.diff.enabled or placement == "new" then
       self:place(placement)
       pcall(vim.cmd.undojoin)
@@ -806,6 +915,7 @@ end
 ---Reset the inline prompt class
 ---@return nil
 function Inline:reset()
+  self:_finish_request()
   self.adapter.opts.stream = _streaming
   self.current_request = nil
   self:_stop_spinner()
@@ -816,6 +926,7 @@ function Inline:reset()
       tool_loop:close()
     end)
   end
+  self:_clear_marks()
   api.nvim_clear_autocmds({ group = self.aug })
 end
 
@@ -1042,9 +1153,6 @@ function Inline:start_diff(args)
     return self:reset()
   end
 
-  -- Store original content for potential restoration on reject
-  self.original_content = args.original_content
-
   -- Show the inline diff - this will transform the buffer from original to new
   local helpers = require("inliber.helpers")
   self.diff_ui = helpers.show_diff({
@@ -1067,13 +1175,29 @@ function Inline:start_diff(args)
       end,
     },
   })
+  self:_track_region(args)
+end
+
+---Mark the lines the diff changed so a reject restores only those
+---@param args { original_content: string[], new_content: string[] }
+---@return nil
+function Inline:_track_region(args)
+  local rows = get_changed_rows({ from = args.original_content, to = args.new_content })
+  self.original_region = vim.list_slice(args.original_content, rows.first + 1, rows.from_end)
+  -- The inline diff adds a spacer line above a hunk that starts on the first line
+  local offset = self.diff_ui.inline_spacer_mark and 1 or 0
+  self.region_mark = api.nvim_buf_set_extmark(self.buffer_context.bufnr, marks_ns, rows.first + offset, 0, {
+    end_row = rows.to_end + offset,
+    end_col = 0,
+    strict = false,
+  })
 end
 
 ---Handle diff accepted event
 ---@return nil
 function Inline:on_diff_accepted()
   log:trace("[Inline] Diff accepted for id=%s", self.id)
-  self.original_content = nil
+  self.original_region = nil
   self.diff_ui = nil
   self:reset()
 end
@@ -1083,11 +1207,15 @@ end
 function Inline:on_diff_rejected()
   log:trace("[Inline] Diff rejected for id=%s, restoring original content", self.id)
 
-  if self.original_content and api.nvim_buf_is_valid(self.buffer_context.bufnr) then
-    api.nvim_buf_set_lines(self.buffer_context.bufnr, 0, -1, false, self.original_content)
+  local bufnr = self.buffer_context.bufnr
+  if self.original_region and api.nvim_buf_is_valid(bufnr) then
+    local mark = api.nvim_buf_get_extmark_by_id(bufnr, marks_ns, self.region_mark, { details = true })
+    if mark[1] then
+      api.nvim_buf_set_lines(bufnr, mark[1], mark[3].end_row, false, self.original_region)
+    end
   end
 
-  self.original_content = nil
+  self.original_region = nil
   self.diff_ui = nil
   self:reset()
 end
