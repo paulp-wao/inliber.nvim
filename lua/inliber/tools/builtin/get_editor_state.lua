@@ -4,6 +4,7 @@ local log = require("inliber.utils.log")
 local markdown = require("inliber.utils.markdown")
 
 local api = vim.api
+local diff_fn = vim.text.diff or vim.diff
 local fmt = string.format
 
 ---@param winid number
@@ -130,6 +131,48 @@ local function read_buffer(args, opts)
   }
 end
 
+---@param bufnr number
+---@return string
+local function get_text(bufnr)
+  return table.concat(api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n") .. "\n"
+end
+
+---@param opts { max_lines: number }
+---@return { status: "success"|"error", data: string }
+local function read_diff(opts)
+  local diff_wins = vim.tbl_filter(function(winid)
+    return vim.wo[winid].diff
+  end, api.nvim_tabpage_list_wins(0))
+  if #diff_wins < 2 then
+    return { status = "error", data = "No diff is open in the current tab" }
+  end
+
+  local old_bufnr = api.nvim_win_get_buf(diff_wins[1])
+  local new_bufnr = api.nvim_win_get_buf(diff_wins[2])
+  local diff = diff_fn(get_text(old_bufnr), get_text(new_bufnr), { result_type = "unified", ctxlen = 3 })
+  if diff == "" then
+    return { status = "success", data = "The diff windows have no differences" }
+  end
+
+  local lines = vim.split(diff, "\n", { trimempty = true })
+  if #lines > opts.max_lines then
+    lines = vim.list_slice(lines, 1, opts.max_lines)
+    table.insert(lines, "... (diff output truncated)")
+  end
+
+  return {
+    status = "success",
+    data = fmt(
+      '<diff old_bufnr="%d" old_path="%s" new_bufnr="%d" new_path="%s">\n%s\n</diff>',
+      old_bufnr,
+      buf_utils.get_info(old_bufnr).relative_path,
+      new_bufnr,
+      buf_utils.get_info(new_bufnr).relative_path,
+      markdown.form_codeblock(table.concat(lines, "\n"), { ft = "diff" })
+    ),
+  }
+end
+
 ---@param host_bufnr number
 ---@param args { action: string, bufnr?: number, start_line?: number, end_line?: number }
 ---@param opts { max_lines: number }
@@ -145,6 +188,8 @@ local function get_editor_state(host_bufnr, args, opts)
     return { status = "success", data = list_tabs() }
   elseif args.action == "read_buffer" then
     return read_buffer(args, opts)
+  elseif args.action == "read_diff" then
+    return read_diff(opts)
   end
 
   return { status = "error", data = fmt("Unknown action: %s", tostring(args.action)) }
@@ -165,14 +210,14 @@ return {
     type = "function",
     ["function"] = {
       name = "get_editor_state",
-      description = "Inspect the user's Neovim editor. List open buffers, windows or tabs, or read a buffer's current contents including unsaved changes.",
+      description = "Inspect the user's Neovim editor. List open buffers, windows or tabs, read a buffer's current contents including unsaved changes, or read the diff the user is viewing.",
       parameters = {
         type = "object",
         properties = {
           action = {
             type = "string",
-            enum = { "list_buffers", "list_windows", "list_tabs", "read_buffer" },
-            description = "What to inspect. Use 'read_buffer' with a bufnr from 'list_buffers' to read a buffer's contents.",
+            enum = { "list_buffers", "list_windows", "list_tabs", "read_buffer", "read_diff" },
+            description = "What to inspect. Use 'read_buffer' with a bufnr from 'list_buffers' to read a buffer's contents. Use 'read_diff' for the unified diff between the diff windows in the current tab, such as a pull request review.",
           },
           bufnr = {
             type = "integer",

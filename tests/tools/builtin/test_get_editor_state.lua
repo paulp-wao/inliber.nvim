@@ -86,6 +86,29 @@ T["GetEditorState"]["numbers lines from start_line"] = function()
   h.expect_not_contains("one", result.data)
 end
 
+T["GetEditorState"]["reads the diff between diff windows"] = function()
+  local result = child.lua([[
+    vim.api.nvim_buf_set_lines(0, 0, -1, false, { "one", "two" })
+    vim.cmd("diffthis | rightbelow vnew")
+    vim.api.nvim_buf_set_lines(0, 0, -1, false, { "one", "three" })
+    vim.cmd("diffthis")
+    return _G.run({ action = "read_diff" })
+  ]])
+
+  h.eq("success", result.status)
+  h.expect_contains("-two", result.data)
+  h.expect_contains("+three", result.data)
+end
+
+T["GetEditorState"]["errors when NO diff is open"] = function()
+  local result = child.lua([[
+    vim.cmd("vnew")
+    return _G.run({ action = "read_diff" })
+  ]])
+
+  h.eq("error", result.status)
+end
+
 T["GetEditorState"]["errors on an invalid bufnr"] = function()
   local result = child.lua([[return _G.run({ action = "read_buffer", bufnr = 9999 })]])
 

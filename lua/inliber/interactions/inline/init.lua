@@ -41,6 +41,7 @@ local agent_commands_providers = require("inliber.interactions.shared.agent_comm
 local client = require("inliber.http")
 local config = require("inliber.config")
 local editor_context = require("inliber.interactions.inline.editor_context")
+local editor_state = require("inliber.interactions.inline.editor_state")
 local keymaps = require("inliber.utils.keymaps")
 local log = require("inliber.utils.log")
 local markdown = require("inliber.utils.markdown")
@@ -80,44 +81,17 @@ Rules:
 - Include comments if appropriate for the language.
 - Do not output anything except the JSON response]],
 
-  SYSTEM_PROMPT_ASK = [[You are a knowledgeable developer working in the Neovim text editor. You answer the user's questions about the %s code in their active Neovim buffer.
+  SYSTEM_PROMPT_ASK = [[You are a knowledgeable developer working in the Neovim text editor. You answer the user's questions about the %s code they are working on.
 
 Your task:
 - Carefully follow the user's prompt (enclosed in <prompt></prompt> tags).
-- Use any provided code context to inform your response.
-- Output only valid JSON as specified below.
-
-Response schema:
-%s
-
-If you cannot answer, respond with a single-sentence reason in %s, enclosed in error tags:
-{
-  "error": "Reason for not being able to answer the prompt"
-}
+- Use the editor state and any other provided context to inform your response.
+- Reply in plain Markdown, in %s. Your reply is shown to the user exactly as written.
 
 Rules:
-- NEVER write or modify code. Your job is only to answer the user's question.
-- Adhere strictly to the JSON schema.
-- Put your full answer to the user in the "message" field.
-- Do not output anything except the JSON response]],
-
-  RESPONSE_ASK = [[Return your answer in valid JSON matching this schema:
-
-{
-  "type": "object",
-  "required": ["message"],
-  "properties": {
-    "message": { "type": "string" }
-  },
-  "additionalProperties": false
-}
-
-Example:
-
-{
-  "message": "Your full answer to the user's prompt."
-}
-]],
+- NEVER modify the user's code. Your job is only to answer the user's question.
+- Short code snippets are fine when they help explain your answer.
+- If you cannot answer, say why in one sentence.]],
 
   RESPONSE_EDIT = [[Return your code and placement in valid JSON matching this schema:
 
@@ -350,6 +324,11 @@ function Inline:prompt(user_prompt)
   -- Add system prompt first
   table.insert(prompts, self:_system_message())
 
+  local editor_state_config = config.interactions.inline.editor_state
+  if editor_state_config.enabled then
+    add_prompt(editor_state.format(self.buffer_context, editor_state_config), user_role, { visible = false })
+  end
+
   -- Followed by prompts from external sources
   local ext_prompts = self:make_ext_prompts()
   if ext_prompts then
@@ -527,6 +506,7 @@ function Inline:submit_with_tools(prompts)
           if self.tool_loop ~= loop then
             return
           end
+          log:debug("[Inline] Tool loop finished with %s, messages:\n%s", result, loop.messages)
           local content
           if result and result.status == CONSTANTS.STATUS_SUCCESS then
             content = loop:last_llm_message()
@@ -595,9 +575,9 @@ end
 ---@return string
 function Inline:_system_prompt()
   if self.intent == "ask" then
-    return CONSTANTS.SYSTEM_PROMPT_ASK
+    return fmt(CONSTANTS.SYSTEM_PROMPT_ASK, self.buffer_context.filetype, config.opts.language)
   end
-  return CONSTANTS.SYSTEM_PROMPT
+  return fmt(CONSTANTS.SYSTEM_PROMPT, self.buffer_context.filetype, CONSTANTS.RESPONSE_EDIT, config.opts.language)
 end
 
 ---Build the system message for the current intent
@@ -605,12 +585,7 @@ end
 function Inline:_system_message()
   return {
     role = config.constants.SYSTEM_ROLE,
-    content = fmt(
-      self:_system_prompt(),
-      self.buffer_context.filetype,
-      self:_response_schema(),
-      config.opts.language
-    ),
+    content = self:_system_prompt(),
     _meta = {
       tag = "system_tag",
     },
@@ -620,19 +595,15 @@ function Inline:_system_message()
   }
 end
 
----Get the response schema for the current intent
----@return string
-function Inline:_response_schema()
-  if self.intent == "ask" then
-    return CONSTANTS.RESPONSE_ASK
-  end
-  return CONSTANTS.RESPONSE_EDIT
-end
-
 ---Prepare messages for the tool loop by appending the JSON format instruction to the user message
 ---@param prompts table The original prompts
 ---@return table Messages suitable for the tool loop
 function Inline:_prepare_tool_messages(prompts)
+  -- Asking for JSON alongside tools makes models send their answer through an invented tool call
+  if self.intent == "ask" then
+    return prompts
+  end
+
   local json_instruction = fmt(
     [[
 
@@ -640,7 +611,7 @@ IMPORTANT: After gathering any context you need, you MUST respond with ONLY vali
 %s
 
 Do not include markdown, code fences, or explanations outside the JSON.]],
-    self:_response_schema()
+    CONSTANTS.RESPONSE_EDIT
   )
 
   local result = {}
@@ -719,34 +690,18 @@ function Inline:done(output)
     return self:_restore_ask_float()
   end
 
+  if self.intent == "ask" then
+    return self:_record_answer(vim.trim(output))
+  end
+
   local json = self:parse_output(output)
   if not json then
     -- Logging is done in parse_output
-    self:reset()
-    return self:_restore_ask_float()
+    return self:reset()
   end
-  if json and json.error then
+  if json.error then
     log:error("[%s] %s", adapter_name, json.error)
-    self:reset()
-    return self:_restore_ask_float()
-  end
-
-  -- An ask intent only ever answers the prompt; the LLM cannot edit the buffer
-  if self.intent == "ask" then
-    local answer = json and json.message
-    self:reset()
-    if not answer or answer == "" then
-      log:error("[%s] Returned no answer", adapter_name)
-      return self:_restore_ask_float()
-    end
-    table.insert(self.messages, { role = config.constants.LLM_ROLE, content = answer })
-    table.insert(self.turns, {
-      question = self.current_question,
-      answer = answer,
-      asked_at = self.current_asked_at,
-      answered_at = os.date("%H:%M"),
-    })
-    return self:_show_answer(self.tokens or tokens.get_tokens(self.messages))
+    return self:reset()
   end
 
   local placement = json and json.placement
@@ -779,6 +734,25 @@ function Inline:done(output)
       code = json.code,
     })
   end)
+end
+
+---Record the LLM's plain-text answer as a turn and show it
+---@param answer string
+---@return nil
+function Inline:_record_answer(answer)
+  self:reset()
+  if answer == "" then
+    log:error("[%s] Returned no answer", self.adapter.formatted_name)
+    return self:_restore_ask_float()
+  end
+  table.insert(self.messages, { role = config.constants.LLM_ROLE, content = answer })
+  table.insert(self.turns, {
+    question = self.current_question,
+    answer = answer,
+    asked_at = self.current_asked_at,
+    answered_at = os.date("%H:%M"),
+  })
+  return self:_show_answer(self.tokens or tokens.get_tokens(self.messages))
 end
 
 ---Show the ask conversation in the chat float
@@ -938,6 +912,7 @@ function Inline:parse_output(output)
     end
   end
 
+  log:debug("[Inline] Unparsable response:\n%s", output)
   return log:error("[Inline] Failed to parse the response")
 end
 

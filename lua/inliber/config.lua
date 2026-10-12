@@ -197,6 +197,10 @@ local defaults = {
           modes = { n = "q" },
         },
       },
+      editor_state = {
+        enabled = true, -- Send the current file, cursor and surrounding code with every prompt?
+        max_lines = 300, -- Send the whole buffer up to this size, otherwise only the visible lines
+      },
       editor_context = {
         ["buffer"] = {
           path = "interactions.inline.editor_context.buffer",

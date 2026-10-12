@@ -43,6 +43,7 @@ T["Inline"] = new_set({
           interactions = {
             inline = {
               adapter = "test_adapter",
+              editor_state = { enabled = false },
             },
           },
         })
@@ -138,9 +139,26 @@ T["Inline"]["uses the ask system prompt when the intent is ask"] = function()
   ]])
 
   local system_prompt = child.lua([[return _G.submitted_prompts[1].content]])
-  h.eq(true, system_prompt:find("NEVER write or modify code", 1, true) ~= nil)
-  h.eq(true, system_prompt:find('"message"', 1, true) ~= nil)
-  h.eq(false, system_prompt:find('"placement"', 1, true) ~= nil)
+  h.eq(true, system_prompt:find("NEVER modify the user's code", 1, true) ~= nil)
+  h.eq(false, system_prompt:find("JSON", 1, true) ~= nil)
+end
+
+T["Inline"]["DOES NOT ask for JSON in the tool loop WHEN the intent is ask"] = function()
+  local content = child.lua([[
+    inline.intent = "ask"
+    return inline:_prepare_tool_messages({ { role = "user", content = "<prompt>why?</prompt>" } })[1].content
+  ]])
+
+  h.eq("<prompt>why?</prompt>", content)
+end
+
+T["Inline"]["asks for JSON in the tool loop WHEN the intent is edit"] = function()
+  local content = child.lua([[
+    inline.intent = "edit"
+    return inline:_prepare_tool_messages({ { role = "user", content = "<prompt>fix it</prompt>" } })[1].content
+  ]])
+
+  h.expect_contains('"placement"', content)
 end
 
 T["Inline"]["reply resends the full conversation history"] = function()
@@ -179,7 +197,7 @@ T["Inline"]["records the answer and turn when the intent is ask"] = function()
     inline.intent = "ask"
     inline.current_question = "what does this do?"
     inline.current_asked_at = "10:00"
-    inline:done('{"message": "it prints"}')
+    inline:done("it prints\n")
   ]])
 
   local recorded = child.lua([[return _G.recorded]])
@@ -361,6 +379,23 @@ T["Inline"]["generates correct prompt structure"] = function()
   h.eq(submitted_prompts[1].role, "system")
   h.eq(submitted_prompts[2].role, "user")
   h.eq(submitted_prompts[2].content, "<prompt>Test prompt</prompt>")
+end
+
+T["Inline"]["sends the editor state before the prompt WHEN enabled"] = function()
+  child.lua([[
+    _G.submitted_prompts = {}
+    function inline:submit(prompts)
+      _G.submitted_prompts = prompts
+    end
+
+    require("inliber.config").interactions.inline.editor_state.enabled = true
+    inline:prompt("Test prompt")
+  ]])
+
+  local submitted_prompts = child.lua([[return _G.submitted_prompts]])
+  h.eq(3, #submitted_prompts)
+  h.expect_contains("<editor_state>", submitted_prompts[2].content)
+  h.eq("<prompt>Test prompt</prompt>", submitted_prompts[3].content)
 end
 
 T["Inline"]["the first word can be an adapter"] = function()
