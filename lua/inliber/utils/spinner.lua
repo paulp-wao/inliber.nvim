@@ -27,6 +27,10 @@ end
 ---Draw the current frame
 ---@return nil
 function Spinner:_render()
+  -- Echoing at a hit-enter or more prompt adds a new line on every frame instead of redrawing
+  if api.nvim_get_mode().mode:sub(1, 1) == "r" then
+    return
+  end
   local text = ("%s %s"):format(frames[self.frame], self.message)
   api.nvim_echo({ { text, "InliberChatInfo" } }, false, {})
 end
