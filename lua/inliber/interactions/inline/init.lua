@@ -95,6 +95,30 @@ Rules:
 - Short code snippets are fine when they help explain your answer.
 - If you cannot answer, say why in one sentence.]],
 
+  -- Enforced via the adapter's structured outputs when using tools. `error` is
+  -- optional so the LLM can still explain why it couldn't answer
+  SCHEMA_ASK = {
+    type = "object",
+    required = { "message" },
+    properties = {
+      message = { type = "string" },
+      error = { type = "string" },
+    },
+    additionalProperties = false,
+  },
+
+  SCHEMA_EDIT = {
+    type = "object",
+    required = { "code", "language", "placement" },
+    properties = {
+      code = { type = "string" },
+      language = { type = "string" },
+      placement = { type = "string", enum = { "replace", "add", "before", "new" } },
+      error = { type = "string" },
+    },
+    additionalProperties = false,
+  },
+
   RESPONSE_EDIT = [[Return your code and placement in valid JSON matching this schema:
 
 {
@@ -607,6 +631,7 @@ function Inline:submit_with_tools(prompts)
     adapter = self.adapter,
     bufnr = self.buffer_context.bufnr,
     messages = messages,
+    structured_output = self:_structured_output(),
     approval_mode = tools.opts and tools.opts.approval_mode,
     callbacks = {
       on_completed = function(loop, result)
@@ -701,6 +726,24 @@ function Inline:_system_message()
       visible = false,
     },
   }
+end
+
+---Get the response schema for the current intent
+---@return string
+function Inline:_response_schema()
+  if self.intent == "ask" then
+    return CONSTANTS.RESPONSE_ASK
+  end
+  return CONSTANTS.RESPONSE_EDIT
+end
+
+---Get the structured output schema for the current intent
+---@return Inliber.StructuredOutput.Schema
+function Inline:_structured_output()
+  if self.intent == "ask" then
+    return { name = "inline_ask", schema = CONSTANTS.SCHEMA_ASK }
+  end
+  return { name = "inline_edit", schema = CONSTANTS.SCHEMA_EDIT }
 end
 
 ---Prepare messages for the tool loop by appending the JSON format instruction to the user message
